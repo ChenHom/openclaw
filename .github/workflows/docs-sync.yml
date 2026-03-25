@@ -1,0 +1,112 @@
+name: Docs Sync & zh-TW Translate
+
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: docs-sync
+  cancel-in-progress: false
+
+jobs:
+  sync-and-translate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: scripts/docs-i18n/go.mod
+
+      - name: Setup upstream
+        run: |
+          git remote add upstream https://github.com/openclaw/openclaw.git || true
+          git fetch --no-tags upstream main
+
+      - name: Sync docs from upstream and collect translation targets
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE="$(git merge-base HEAD upstream/main)"
+          echo "merge_base=${BASE}" >> "$GITHUB_OUTPUT"
+
+          mapfile -t changed_docs < <(
+            git diff --name-only --diff-filter=ACMR "$BASE" upstream/main -- docs \
+              | rg -v '^docs/zh-TW/'
+          )
+
+          mapfile -t deleted_docs < <(
+            git diff --name-only --diff-filter=D "$BASE" upstream/main -- docs \
+              | rg -v '^docs/zh-TW/'
+          )
+
+          if (( ${#changed_docs[@]} > 0 )); then
+            git checkout upstream/main -- "${changed_docs[@]}"
+          fi
+
+          if (( ${#deleted_docs[@]} > 0 )); then
+            rm -f "${deleted_docs[@]}"
+          fi
+
+          # Keep zh-TW mirror in sync when upstream source docs are removed.
+          for src in "${deleted_docs[@]}"; do
+            if [[ "$src" =~ ^docs/(zh-CN|ja-JP|zh-TW)/ ]]; then
+              continue
+            fi
+            rel="${src#docs/}"
+            rm -f "docs/zh-TW/${rel}"
+          done
+
+          mapfile -t changed_source_docs < <(
+            printf '%s\n' "${changed_docs[@]:-}" \
+              | rg '\.mdx?$' \
+              | rg -v '^docs/(zh-TW|zh-CN|ja-JP|assets|images|\.i18n)/'
+          )
+
+          if (( ${#changed_source_docs[@]} == 0 )); then
+            echo "has_source_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No source markdown docs changed in upstream."
+            exit 0
+          fi
+
+          printf '%s\n' "${changed_source_docs[@]}" > /tmp/docs-sync-files.txt
+          echo "has_source_changes=true" >> "$GITHUB_OUTPUT"
+          echo "source_count=${#changed_source_docs[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Translate changed docs to zh-TW
+        if: steps.collect.outputs.has_source_changes == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < /tmp/docs-sync-files.txt
+          if (( ${#files[@]} == 0 )); then
+            exit 0
+          fi
+          go run ./scripts/docs-i18n --lang=zh-TW --mode=doc --thinking=low --parallel=4 "${files[@]}"
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$(git status --porcelain)" ]]; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "docs(i18n): sync upstream docs and update zh-TW"
+          git push origin HEAD:main
