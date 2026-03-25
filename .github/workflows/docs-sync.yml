@@ -21,33 +21,52 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
         with:
-          go-version-file: scripts/docs-i18n/go.mod
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.23.0
+
+      - name: Resolve pnpm store path
+        id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore pnpm store cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-docs-sync-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-docs-sync-pnpm-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
 
       - name: Setup upstream
         run: |
           git remote add upstream https://github.com/openclaw/openclaw.git || true
           git fetch --no-tags upstream main
 
-      - name: Sync docs from upstream and collect translation targets
-        id: collect
+      - name: Sync docs from upstream
         shell: bash
         run: |
           set -euo pipefail
 
           BASE="$(git merge-base HEAD upstream/main)"
-          echo "merge_base=${BASE}" >> "$GITHUB_OUTPUT"
 
           mapfile -t changed_docs < <(
             git diff --name-only --diff-filter=ACMR "$BASE" upstream/main -- docs \
-              | rg -v '^docs/zh-TW/'
+              | grep -Ev '^docs/zh-TW/' || true
           )
 
           mapfile -t deleted_docs < <(
             git diff --name-only --diff-filter=D "$BASE" upstream/main -- docs \
-              | rg -v '^docs/zh-TW/'
+              | grep -Ev '^docs/zh-TW/' || true
           )
 
           if (( ${#changed_docs[@]} > 0 )); then
@@ -58,7 +77,6 @@ jobs:
             rm -f "${deleted_docs[@]}"
           fi
 
-          # Keep zh-TW mirror in sync when upstream source docs are removed.
           for src in "${deleted_docs[@]}"; do
             if [[ "$src" =~ ^docs/(zh-CN|ja-JP|zh-TW)/ ]]; then
               continue
@@ -67,34 +85,10 @@ jobs:
             rm -f "docs/zh-TW/${rel}"
           done
 
-          mapfile -t changed_source_docs < <(
-            printf '%s\n' "${changed_docs[@]:-}" \
-              | rg '\.mdx?$' \
-              | rg -v '^docs/(zh-TW|zh-CN|ja-JP|assets|images|\.i18n)/'
-          )
-
-          if (( ${#changed_source_docs[@]} == 0 )); then
-            echo "has_source_changes=false" >> "$GITHUB_OUTPUT"
-            echo "No source markdown docs changed in upstream."
-            exit 0
-          fi
-
-          printf '%s\n' "${changed_source_docs[@]}" > /tmp/docs-sync-files.txt
-          echo "has_source_changes=true" >> "$GITHUB_OUTPUT"
-          echo "source_count=${#changed_source_docs[@]}" >> "$GITHUB_OUTPUT"
-
-      - name: Translate changed docs to zh-TW
-        if: steps.collect.outputs.has_source_changes == 'true'
+      - name: Run Translation Script
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mapfile -t files < /tmp/docs-sync-files.txt
-          if (( ${#files[@]} == 0 )); then
-            exit 0
-          fi
-          go run ./scripts/docs-i18n --lang=zh-TW --mode=doc --thinking=low --parallel=4 "${files[@]}"
+        run: pnpm run docs:translate
 
       - name: Commit and push
         shell: bash
